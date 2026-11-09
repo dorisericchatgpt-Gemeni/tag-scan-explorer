@@ -8,7 +8,7 @@ from scipy.special import j0
 
 from tagscan import tag_unified_psf as tup
 from tagscan.model import Params, Fixed, compute, centroid_shift, tag_field, _QDHT
-from tagscan.scanner import fov_grid
+from tagscan.scanner import fov_grid, scan_metrics
 
 
 @pytest.fixture(scope="module")
@@ -100,3 +100,20 @@ def test_scanner_square_without_bow():
     assert fx_[-1, m] == pytest.approx(16.8e3 * np.tan(np.radians(14)) / 4, rel=1e-6)
     bx, by, _, _ = fov_grid(9, 14.0, 5.0, 0.0, 45.0, 4.0, 16.8)
     assert np.abs(by[:, m]).max() > 10         # tilted axis -> the X scan line bows in y
+
+
+def test_shaft_in_plane_of_incidence_matches_poster_model():
+    # independent vector model (LFOV4D poster, shafts tilted into the plane of incidence):
+    # field 1.69 x 1.52 mm with angle/M2 mapping, every fast line bows 63 um
+    fx_, fy_, _, _ = fov_grid(41, 14.0, 90.0, 90.0, 45.0, 4.0, 16.8)
+    m = scan_metrics(fx_, fy_)
+    assert m["width_mm"] == pytest.approx(1.69, abs=0.05)
+    assert m["height_mm"] == pytest.approx(1.52, abs=0.05)
+    assert m["bow_um"] == pytest.approx(63, abs=5)
+    assert abs(abs(m["rotation_deg"]) - 90) < 1          # that mirror now sweeps the other axis
+
+
+def test_mis_mounted_galvo_runs_through_model():
+    s = compute(Params(beta_x_deg=90.0, beta_y_deg=90.0), "fast").summary
+    assert s["scan"]["bow_um"] > 50
+    assert s["edge"]["sweep"][1] - s["edge"]["sweep"][0] > 150

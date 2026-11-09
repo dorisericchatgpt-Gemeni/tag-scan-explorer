@@ -37,9 +37,10 @@ SPECS = [
     ("tag_offset_mm", "2. TAG 離共軛面 d (mm)", -50.0, 50.0, 0.5, 1,
      "TAG 空間的錯位。d > 0：TAG 在共軛面的雷射側（光先傳播 d 才到共軛面）。"),
     ("vt_peak_D", "3. TAG 屈光度峰值 ±V_T (D)", 1.0, 20.0, 0.5, 1, "TAG 光學屈光度振幅。"),
-    ("beta_x_deg", "4a. X galvo 轉軸傾斜 β_x (°)", -10.0, 10.0, 0.1, 1,
-     "轉軸在鏡面內、偏離「垂直入射平面」的角度 → 掃描線弓形。"),
-    ("beta_y_deg", "4b. Y galvo 轉軸傾斜 β_y (°)", -10.0, 10.0, 0.1, 1, "同上，Y 鏡。"),
+    ("beta_x_deg", "4a. X galvo 轉軸傾斜 β_x (°)", -90.0, 90.0, 0.5, 1,
+     "轉軸在鏡面內、偏離「垂直入射平面」的角度。\n0° = 正確安裝；小角度主要讓掃描線旋轉（約 0.7°/°）並微彎；\n"
+     "90° = 轉軸整個落在入射面內（裝錯）：該鏡改沿另一軸掃、視野縮到約 1.7 × 1.5 mm、每條線彎約 65 µm。"),
+    ("beta_y_deg", "4b. Y galvo 轉軸傾斜 β_y (°)", -90.0, 90.0, 0.5, 1, "同上，Y 鏡。"),
     ("galvo_incidence_deg", "4c. galvo 入射角 (°)（假設）", 20.0, 70.0, 1.0, 0,
      "鏡面法線與入射光夾角，弓形大小取決於它。預設 45°。"),
     ("galvo_offset_mm", "5. galvo 離共軛面 Δg (mm)", -2.0, 2.0, 0.01, 2,
@@ -124,6 +125,14 @@ class MainWindow(QtWidgets.QMainWindow):
             form.addWidget(sp, 2 * row + 1, 1)
             self.spins[attr] = sp
         lv.addLayout(form)
+        mount = QtWidgets.QHBoxLayout()
+        mount.addWidget(QtWidgets.QLabel("galvo 安裝："))
+        for txt, b in (("正確 β=0°", 0.0), ("裝錯 β=90°（軸在入射面內）", 90.0)):
+            btn = QtWidgets.QPushButton(txt)
+            btn.clicked.connect(lambda _=False, b=b: (self.spins["beta_x_deg"].setValue(b),
+                                                     self.spins["beta_y_deg"].setValue(b)))
+            mount.addWidget(btn)
+        lv.addLayout(mount)
         reset = QtWidgets.QPushButton("全部回到預設")
         reset.clicked.connect(self._reset)
         lv.addWidget(reset)
@@ -266,7 +275,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         X, Y, Z = self._geom()
         zs = self.zsc.value()
-        g = pv.StructuredGrid(X, Y, Z * zs)   # +z = deeper; camera 'up' is -z
+        g = pv.StructuredGrid(X, Y, -Z * zs)  # z = -depth (right-handed, deeper = lower)
         g["V"] = self.res.V.ravel(order="F")
         cam = None if self._first else self.plotter.camera_position
         self.plotter.clear()
@@ -279,7 +288,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if use.n_points:
             self.plotter.add_mesh(use, color="#1f3f8f", opacity=0.95)
         b = g.bounds   # depth is drawn stretched; label the axis with true depths
-        self.plotter.show_grid(xtitle="x (um)", ytitle="y (um)", ztitle="depth below surface (um)",
+        self.plotter.show_grid(xtitle="x (um)", ytitle="y (um)", ztitle="z = -depth below surface (um)",
                                font_size=10, color="black", fmt="%.0f",
                                axes_ranges=[b[0], b[1], b[2], b[3], b[4] / zs, b[5] / zs])
         k = self.exag.value()
@@ -297,12 +306,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._draw_slice()
 
     def _view(self, f):
-        """Camera presets with depth pointing DOWN on screen (data z = +depth)."""
+        """Camera presets; data z = -depth, so deeper is lower on screen and x, y read normally."""
         pl = self.plotter
         b = pl.bounds
         c = np.array([(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2])
-        d, up = {"iso": ((1.0, -1.0, -0.8), (0, 0, -1)), "xz": ((0, 1.0, 0), (0, 0, -1)),
-                 "yz": ((-1.0, 0, 0), (0, 0, -1)), "xy": ((0, 0, -1.0), (0, 1, 0))}[f]
+        d, up = {"iso": ((1.0, -1.0, 0.8), (0, 0, 1)), "xz": ((0, -1.0, 0), (0, 0, 1)),
+                 "yz": ((1.0, 0, 0), (0, 0, 1)), "xy": ((0, 0, 1.0), (0, 1, 0))}[f]
         pl.camera_position = [tuple(c + 5000 * np.array(d)), tuple(c), up]
         pl.reset_camera()
         pl.render()
@@ -321,7 +330,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "<th>D=0 µm</th><th>相對亮度</th><th>頂−底橫移 µm</th></tr>"
                 + row("軸上", s["axis"]) + row("邊緣", s["edge"]) + row("角落", s["corner"]) + "</table>"
                 f"M_net {s['M_net']:.2f}；近軸每 D {s['dz_per_D_um']:.2f} µm；"
-                f"TAG 相位振幅 {s['Phi_rad']:.0f} rad；FOV {s['fov_x_mm']:.2f} mm（中線寬）<br>"
+                f"TAG 相位振幅 {s['Phi_rad']:.0f} rad<br>"
+                f"<b>掃描範圍</b> {s['scan']['width_mm']:.2f} × {s['scan']['height_mm']:.2f} mm（外框）；"
+                f"快軸線長 {s['scan']['fast_line_mm']:.2f} mm、旋轉 {s['scan']['rotation_deg']:.1f}°、"
+                f"最大弓形 {s['scan']['bow_um']:.0f} µm<br>"
                 "深度 = 組織表面下；頂−底橫移 = c=+1（淺端）減 c=−1（深端）的徑向位置，"
                 "負值 = 淺端偏向中心。")
         for w in self.res.warnings:
@@ -356,13 +368,22 @@ class MainWindow(QtWidgets.QMainWindow):
             title = (f"XY 切面：深度 {q:.0f} µm" if i == 0 else
                      f"XY：D=0 焦面（深度 {r.zd0.min():.1f}–{r.zd0.max():.1f} µm）")
             return "xy", Xs, Ys, Vs, title, ("x (µm)", "y (µm)"), (None if i == 0 else r.zd0)
-        if i == 2:
-            j = int(np.argmin(np.abs(r.fy[n // 2, :] - q)))
-            return ("xz", X[:, j, :], Z[:, j, :], r.V[:, j, :],
-                    f"XZ 切面：y = {r.fy[n // 2, j]:.0f} µm", ("x (µm)", "深度 (µm)"), None)
-        a = int(np.argmin(np.abs(r.fx[:, n // 2] - q)))
-        return ("yz", Y[a, :, :], Z[a, :, :], r.V[a, :, :],
-                f"YZ 切面：x = {r.fx[a, n // 2]:.0f} µm", ("y (µm)", "深度 (µm)"), None)
+        # pick the family of scan lines that runs along x (for XZ) or y (for YZ); a
+        # mis-mounted galvo (beta ~ 90 deg) swaps which mirror sweeps which axis
+        c = n // 2
+        along0 = abs(r.fx[-1, c] - r.fx[0, c]) >= abs(r.fx[c, -1] - r.fx[c, 0])   # i-lines run along x
+        want_x = (i == 2)
+        lines_i = (along0 == want_x)          # True: take a line with fixed j (varying i)
+        other = r.fy if want_x else r.fx      # coordinate that must equal q
+        if lines_i:
+            k = int(np.argmin(np.abs(other[c, :] - q)))
+            A, B, Vv, at = (X if want_x else Y)[:, k, :], Z[:, k, :], r.V[:, k, :], other[c, k]
+        else:
+            k = int(np.argmin(np.abs(other[:, c] - q)))
+            A, B, Vv, at = (X if want_x else Y)[k, :, :], Z[k, :, :], r.V[k, :, :], other[k, c]
+        if want_x:
+            return ("xz", A, B, Vv, f"XZ 切面：y ≈ {at:.0f} µm（沿一條掃描線）", ("x (µm)", "深度 (µm)"), None)
+        return ("yz", A, B, Vv, f"YZ 切面：x ≈ {at:.0f} µm（沿一條掃描線）", ("y (µm)", "深度 (µm)"), None)
 
     def _draw_slice(self, *_):
         if self.res is None:

@@ -38,7 +38,7 @@ import numpy as np
 from scipy.special import j0, j1, jn_zeros
 
 from . import tag_unified_psf as tup
-from .scanner import fov_grid
+from .scanner import fov_grid, scan_metrics
 
 THR = float(np.exp(-2))          # usable threshold: e^-2 of the global brightest point
 
@@ -330,8 +330,9 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
     fxg, fyg, tanpx, tanpy = fov_grid(p.n_field, fx.galvo_optical_deg, p.beta_x_deg, p.beta_y_deg,
                                       p.galvo_incidence_deg, fx.M2, fx.F_mm)
     rf = np.hypot(fxg, fyg)                                   # um
-    r_edge = float(np.abs(fxg[:, p.n_field // 2]).max())
-    r_corner = float(np.hypot(fxg[-1, -1], fyg[-1, -1]))
+    c_ = p.n_field // 2
+    r_edge = float(np.hypot(fxg[:, c_], fyg[:, c_]).max())      # end of the centre fast line
+    r_corner = float(max(np.hypot(fxg[i, j], fyg[i, j]) for i in (0, -1) for j in (0, -1)))
     radii = np.unique(np.round(np.r_[np.linspace(0, 1, 5) * r_corner, r_edge, r_corner, rf.max()], 3))
 
     # ---- depth grid ----
@@ -430,7 +431,7 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
     k_corner = int(np.argmin(np.abs(radii - r_corner)))
     summ = {"axis": stats(0), "edge": stats(k_edge), "corner": stats(k_corner),
             "M_net": M, "dz_per_D_um": dz_per_D, "Phi_rad": Phi, "h_air_mm": h,
-            "fov_x_mm": 2 * r_edge * 1e-3, "r_corner_um": r_corner,
+            "fov_x_mm": 2 * r_edge * 1e-3, "r_corner_um": r_corner, "scan": scan_metrics(fxg, fyg),
             "radii_um": radii, "zpk": zpk, "lat": lat, "peak": pkr, "cs": cs}
     if (zpk.min() + min(0.0, p.field_curv_um)) < 0:
         warn.append("Part of the TAG sweep lies above the tissue surface (in air); "

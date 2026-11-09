@@ -62,6 +62,22 @@ def fov_grid(n: int, optical_deg: float, beta_x: float, beta_y: float,
     """Return field positions (fx, fy) in um on an n x n grid of galvo angles, and the
     pupil-angle tangents (tan_px, tan_py). Index [i, j]: i = X galvo, j = Y galvo."""
     th = np.radians(np.linspace(-optical_deg, optical_deg, n)) / 2.0     # mechanical
+    TX, TY = _raw(th, beta_x, beta_y, incidence_deg)
+    # Lab axes are fixed by the correctly mounted scanner (beta = 0): field x grows with
+    # the X galvo angle, y with the Y galvo angle. A mis-mounted mirror is then shown in
+    # the same frame -- e.g. a shaft lying in the plane of incidence (beta = 90 deg) makes
+    # that mirror sweep the spot along the OTHER axis, which is what really happens.
+    IX, IY = _raw(th, 0.0, 0.0, incidence_deg)
+    if IX[-1, n // 2] < IX[0, n // 2]:
+        TX = -TX
+    if IY[n // 2, -1] < IY[n // 2, 0]:
+        TY = -TY
+    tpx, tpy = TX / M2, TY / M2
+    return F_mm * 1e3 * tpx, F_mm * 1e3 * tpy, tpx, tpy
+
+
+def _raw(th, beta_x, beta_y, incidence_deg):
+    n = th.size
     mx, my = _Mirror(incidence_deg, beta_x), _Mirror(incidence_deg, beta_y)
     d0 = np.array([0.0, 0.0, 1.0])
     TX = np.empty((n, n))
@@ -69,17 +85,33 @@ def fov_grid(n: int, optical_deg: float, beta_x: float, beta_y: float,
     for i, a in enumerate(th):
         sx, cx = mx.out_tan(d0, a)               # X galvo: scan along its e_scan
         # 1:1 relay inverts angles; the X deviation must arrive along mirror Y's
-        # cross axis (y of its frame), the bow component along its scan axis (x).
+        # cross axis (y of its frame), the cross component along its scan axis (x).
         d_in = np.array([-cx, -sx, 1.0])
         d_in /= np.linalg.norm(d_in)
         for j, b in enumerate(th):
             sy, cy = my.out_tan(d_in, b)
             TX[i, j] = cy                         # carried X scan
             TY[i, j] = sy                         # Y scan
-    # sign convention: field x grows with the X galvo angle, y with the Y galvo angle
-    if TX[-1, n // 2] < TX[0, n // 2]:
-        TX = -TX
-    if TY[n // 2, -1] < TY[n // 2, 0]:
-        TY = -TY
-    tpx, tpy = TX / M2, TY / M2
-    return F_mm * 1e3 * tpx, F_mm * 1e3 * tpy, tpx, tpy
+    return TX, TY
+
+
+def scan_metrics(fx: np.ndarray, fy: np.ndarray) -> dict:
+    """Field extent and line quality of a scan grid [i = X galvo, j = Y galvo] (um).
+    bow = largest sagitta of any X-galvo (fast) line, measured perpendicular to its own
+    chord, so it is independent of how the line is rotated; rotation = angle of the
+    centre fast line from the x axis."""
+    n = fx.shape[1]
+    bows = []
+    for j in range(n):
+        p = np.c_[fx[:, j], fy[:, j]]
+        ch = p[-1] - p[0]
+        L = np.hypot(*ch)
+        if L == 0:
+            continue
+        nrm = np.array([-ch[1], ch[0]]) / L
+        bows.append(np.abs((p - p[0]) @ nrm).max())
+    c = n // 2
+    rot = np.degrees(np.arctan2(fy[-1, c] - fy[0, c], fx[-1, c] - fx[0, c]))
+    return {"width_mm": float(np.ptp(fx)) * 1e-3, "height_mm": float(np.ptp(fy)) * 1e-3,
+            "bow_um": float(max(bows)) if bows else 0.0, "rotation_deg": float(rot),
+            "fast_line_mm": float(np.hypot(fx[-1, c] - fx[0, c], fy[-1, c] - fy[0, c])) * 1e-3}
