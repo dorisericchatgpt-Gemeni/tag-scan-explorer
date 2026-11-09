@@ -1,0 +1,102 @@
+"""Regression checks: the explorer's model against tag_unified_psf and independent references.
+Run: python -m pytest -q tests"""
+import dataclasses
+
+import numpy as np
+import pytest
+from scipy.special import j0
+
+from tagscan import tag_unified_psf as tup
+from tagscan.model import Params, Fixed, compute, centroid_shift, tag_field, _QDHT
+from tagscan.scanner import fov_grid
+
+
+@pytest.fixture(scope="module")
+def ref_axis():
+    cfg = tup.apply_sampling_guard(tup.PRESETS["mesoscale"], verbose=False)
+    tr = tup.scan_trajectory(cfg, 0.0)
+    zp = tr["z_peak"] - cfg.L2_mm * 1e3
+    pk = (tr["I1"] ** 2).max(axis=1)
+    ok = pk >= np.exp(-2) * pk.max()
+    return zp, ok
+
+
+def test_fast_matches_tag_unified_on_axis(ref_axis):
+    zp, ok = ref_axis
+    s = compute(Params(), "fast").summary["axis"]
+    assert abs(s["sweep"][0] - zp.min()) < 3.0
+    assert abs(s["sweep"][1] - zp.max()) < 1.5
+    assert abs(s["usable"][0] - zp[ok].min()) < 1.5
+    assert abs(s["d0_depth"] - Params().focus_depth_um) < 0.5
+
+
+def test_precise_equals_fast_on_axis():
+    a = compute(Params(), "fast").summary["axis"]
+    b = compute(Params(), "precise").summary
+    for k in ("axis", "edge", "corner"):          # telecentric, aligned: every field point the same
+        assert abs(b[k]["sweep"][0] - a["sweep"][0]) < 1.0
+        assert abs(b[k]["sweep"][1] - a["sweep"][1]) < 1.0
+        assert abs(b[k]["brightness"] - 1.0) < 0.02
+
+
+def test_galvo_shear():
+    # independent 2-D wave calculation (FFT pupil, homogeneous tissue): -0.80 um per 0.1 mm at the edge
+    pr = compute(Params(galvo_offset_mm=0.3), "precise").summary
+    fa = compute(Params(galvo_offset_mm=0.3), "fast").summary
+    assert pr["edge"]["shear_um"] == pytest.approx(-2.4, abs=0.3)
+    assert fa["edge"]["shear_um"] == pytest.approx(pr["edge"]["shear_um"], rel=0.2)
+    assert pr["corner"]["shear_um"] < pr["edge"]["shear_um"] < 0     # grows with field radius
+
+
+def test_hankel_matches_fft_propagation():
+    fx, p = Fixed(), Params(tag_offset_mm=40.0)
+    cs = np.array([1.0])
+    rho, E = tag_field(p, fx, cs)
+    # 2-D FFT angular-spectrum reference
+    N, L = 1024, 12.0
+    x = (np.arange(N) - N // 2) * L / N
+    X, Y = np.meshgrid(x, x)
+    R = np.hypot(X, Y)
+    Phi = 2 * fx.k0 * (p.vt_peak_D * 1e-3) / fx.k_r ** 2
+    E0 = np.exp(-(R / p.w_tag_mm) ** 2) * np.exp(1j * Phi * j0(fx.k_r * R))
+    k = np.fft.fftfreq(N, L / N) * 2 * np.pi
+    KX, KY = np.meshgrid(k, k)
+    kz = np.sqrt(np.maximum(fx.k0 ** 2 - KX ** 2 - KY ** 2, 0))
+    Ef = np.fft.ifft2(np.fft.fft2(E0) * np.exp(1j * (kz - fx.k0) * p.tag_offset_mm))
+    line = Ef[N // 2, N // 2:]
+    r_line = x[N // 2:]
+    sel = r_line < 1.6
+    ref = line[sel]
+    got = np.interp(r_line[sel], rho, E[0].real) + 1j * np.interp(r_line[sel], rho, E[0].imag)
+    assert np.abs(got - ref).max() < 0.03      # |E| ~ 1.6; FFT reference itself ~1 % off at N 1024
+
+
+def test_tag_offset_direction():
+    top, bot = centroid_shift(Params(tag_offset_mm=40.0))
+    assert top < -30 and bot < -5          # whole sweep moves shallower, top end more
+    t2, b2 = centroid_shift(Params(tag_offset_mm=-40.0))
+    assert t2 > 5 and b2 > 30              # mirrored for d < 0
+
+
+def test_tilted_cone_against_tag_unified():
+    p = Params(pupil_offset_mm=16.8)
+    s = compute(p, "precise").summary
+    u1 = np.arctan(s["r_corner_um"] * 1e-3 * 16.8 / 16.8 ** 2)
+    cfg = tup.apply_sampling_guard(dataclasses.replace(tup.PRESETS["mesoscale"], clip_vignetting=False),
+                                   verbose=False)
+    zp = tup.scan_trajectory(cfg, u1)["z_peak"]
+    th_ref = zp.max() - zp.min()
+    th = s["corner"]["sweep"][1] - s["corner"]["sweep"][0]
+    # both trackers follow the brightest point, which hops between Bessel side lobes at the
+    # dim sweep ends (tag_unified gives 187.3 um at 4.95 deg but 184.6 um at 5.11 deg)
+    assert th == pytest.approx(th_ref, abs=5.0)
+
+
+def test_scanner_square_without_bow():
+    fx_, fy_, _, _ = fov_grid(9, 14.0, 0.0, 0.0, 45.0, 4.0, 16.8)
+    m = 4
+    assert np.allclose(fy_[:, m], 0, atol=1e-9) and np.allclose(fx_[m, :], 0, atol=1e-9)
+    assert np.allclose(fx_, -fx_[::-1, :]) and np.allclose(fy_, -fy_[:, ::-1])
+    assert fx_[-1, m] == pytest.approx(16.8e3 * np.tan(np.radians(14)) / 4, rel=1e-6)
+    bx, by, _, _ = fov_grid(9, 14.0, 5.0, 0.0, 45.0, 4.0, 16.8)
+    assert np.abs(by[:, m]).max() > 10         # tilted axis -> the X scan line bows in y
