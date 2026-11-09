@@ -319,6 +319,24 @@ class ScanPage(QtWidgets.QWidget):
                               f"depth drawn x{zs:g};  lateral offsets drawn x{k:g}"
                               + ("  (NOT true scale)" if k != 1 else ""),
                               position="upper_left", font_size=9, color="black")
+        # on-axis centres: red = middle of the whole sweep, orange = middle of the usable range
+        a = self.res.summary["axis"]
+        ref = "Piezo=0" if self.kind == "piezo" else "D=0"
+        lines = [f"on axis: scan centre {a['centre']:.1f} um (red)"]
+        pts = [(a["centre"], "red")]
+        if np.isfinite(a["usable_centre"]):
+            lines.append(f"usable centre {a['usable_centre']:.1f} um (orange)")
+            pts.append((a["usable_centre"], "orange"))
+        lines.append(f"{ref} focus {a['d0_depth']:.1f} um")
+        # drawn just outside the +x face (inside, the opaque solid would hide them), with a
+        # grey bar for the on-axis sweep
+        xm = b[1] + 0.06 * (b[1] - b[0])
+        rad = 0.015 * (b[1] - b[0])
+        self.plotter.add_mesh(pv.Line((xm, 0.0, -a["sweep"][0] * zs), (xm, 0.0, -a["sweep"][1] * zs)),
+                              color="grey", line_width=3)
+        for zc, col in pts:
+            self.plotter.add_mesh(pv.Sphere(radius=rad, center=(xm, 0.0, -zc * zs)), color=col)
+        self.plotter.add_text("\n".join(lines), position="lower_right", font_size=10, color="black")
         if cam is None:
             self._view("iso")
             self._first = False
@@ -347,11 +365,14 @@ class ScanPage(QtWidgets.QWidget):
         def row(name, d):
             sw, us = d["sweep"], d["usable"]
             uu = (f"{us[0]:.0f}–{us[1]:.0f}（{us[1]-us[0]:.0f}）" if np.isfinite(us[0]) else "無")
+            uc = f"{d['usable_centre']:.0f}" if np.isfinite(d["usable_centre"]) else "—"
             return (f"<tr><td>{name}</td><td>{sw[0]:.0f}–{sw[1]:.0f}（{sw[1]-sw[0]:.0f}）</td>"
-                    f"<td>{uu}</td><td>{d['d0_depth']:.0f}</td><td>{d['brightness']:.2f}</td>"
+                    f"<td>{d['centre']:.0f}</td><td>{uu}</td><td>{uc}</td>"
+                    f"<td>{d['d0_depth']:.0f}</td><td>{d['brightness']:.2f}</td>"
                     f"<td>{d['shear_um']:+.2f}</td></tr>")
 
-        html = ("<table cellspacing=4><tr><th></th><th>主峰掃描 µm</th><th>可用 µm</th>"
+        html = ("<table cellspacing=4><tr><th></th><th>主峰掃描 µm</th><th>掃描中心</th>"
+                "<th>可用 µm</th><th>可用中心</th>"
                 f"<th>{'Piezo=0' if piezo else 'D=0'} µm</th><th>相對亮度</th><th>頂−底橫移 µm</th></tr>"
                 + row("軸上", s["axis"]) + row("邊緣", s["edge"]) + row("角落", s["corner"]) + "</table>"
                 + (f"Piezo ±{self.p.piezo_range_um:.0f} µm → 組織內每 µm 物鏡移動 "

@@ -462,6 +462,7 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
              "shear_um": float(lat[k][0] - lat[k][-1]),       # c = +1 (shallow) minus c = -1 (deep)
              "d0_depth": float(zpk[k][ic0] + fck)}
         d["centre"] = 0.5 * (d["sweep"][0] + d["sweep"][1])
+        d["usable_centre"] = 0.5 * (d["usable"][0] + d["usable"][1])
         return d
 
     k_edge = int(np.argmin(np.abs(radii - r_edge)))
