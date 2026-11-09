@@ -33,7 +33,7 @@ Depth z is in micrometres below the tissue surface; optical lengths are in mm.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 import numpy as np
 from scipy.special import j0, j1, jn_zeros
 
@@ -86,6 +86,7 @@ class Params:
     vignette_corner: float = 1.0             # retained pupil area fraction at the corner
     n_field: int = 21                        # field points per axis
     n_time: int = 25                         # TAG phases over half a period (c = +1 .. -1)
+    piezo_range_um: float = 100.0            # piezo page: objective travel +- (um)
 
 
 @dataclass
@@ -202,11 +203,13 @@ def calibrate_h(p: Params, fx: Fixed) -> float:
 # 2-D pupil integral at one field radius
 # =============================================================================
 def _profile_2d(fx: Fixed, M: float, h: float, z: np.ndarray, rho_g, Etag,
-                u1: float, s: float, delta: float, npx: int):
+                u1: float, s, delta: float, npx: int, dh=None):
     """Return (I2[c, z], zpk[c], xoff[c]) for a field point whose chief ray leaves the
     objective at angle u1 (air), with the beam walked by s (mm) and the pupil clipped by a
     circle offset delta (mm), all along +x (the field radius). xoff is the lateral offset of
-    the focus from the refracted chief ray through the c = 0 focus depth (um)."""
+    the focus from the refracted chief ray through the c = 0 focus depth (um).
+    Piezo page: s may be an array (one beam walk per row) and dh (mm, per row) is how far
+    the objective moved toward the sample for that row (its air focus goes dh deeper)."""
     k0, n3, F, R = fx.k0, fx.n_tissue, fx.F_mm, fx.R_mm
     g = (np.arange(-npx, npx + 1) + 0.0) * (R / npx)
     PX, PY = np.meshgrid(g, g, indexing="ij")
@@ -221,14 +224,29 @@ def _profile_2d(fx: Fixed, M: float, h: float, z: np.ndarray, rho_g, Etag,
     kz3 = np.sqrt(np.maximum((n3 * k0) ** 2 - kx ** 2 - ky ** 2, 0.0))
     fres = tup._fresnel_avg(np.maximum(kz1, 1e-9), kz3, 1.0, n3)
     w = np.sqrt(cth) / cth * fres * (R / npx) ** 2 / F ** 2
-    rho = np.hypot(px - s, py) / M
-    Ep = _interp_c(rho_g, Etag, rho)                            # (nc, N), Gaussian included
+    if np.ndim(s) == 0:
+        Ep = _interp_c(rho_g, Etag, np.hypot(px - s, py) / M)   # (nc, N), Gaussian included
+    else:
+        Ep = np.stack([_interp_c(rho_g, Etag[i:i + 1], np.hypot(px - si, py) / M)[0]
+                       for i, si in enumerate(np.asarray(s))])
     tan3 = np.tan(np.arcsin(su / n3))
     # the tilted cone aims at the air point (0, h): its chief ray meets the interface at
     # x = -h tan(u1) and continues in tissue as x(z) = -h tan(u1) + z tan(u3)
     x_int = -h * np.tan(u1)
-    vec = (Ep * (w * np.exp(-1j * (kz1 * h - kx * x_int)))[None, :]).astype(np.complex64)
-    kxl = (kx * tan3 + kz3).astype(np.float32)                 # phase rate along the chief ray
+    vec = Ep * (w * np.exp(-1j * (kz1 * h - kx * x_int)))[None, :]
+    if dh is not None:
+        # objective moved toward the sample by dh: the whole converging cone translates
+        # rigidly, so its air aim point moves straight down (h -> h + dh) with no lateral
+        # change. Paraxially the tissue focus therefore does not lean even when the
+        # objective is not telecentric (unlike TAG, which changes the cone's convergence).
+        vec = vec * np.exp(-1j * np.outer(dh, kz1))
+        # each piezo focus sits at a fixed lateral position, so search along a VERTICAL
+        # line through the D0 point of the refracted chief ray instead of along that ray
+        zc = z[z.size // 2] * 1e-3
+        vec = vec * np.exp(1j * kx * zc * tan3)[None, :]
+        tan3 = 0.0
+    vec = vec.astype(np.complex64)
+    kxl = (kx * tan3 + kz3).astype(np.float32)                 # phase rate along the search line
 
     kxl = kxl.astype(np.float64)
     dzm = (z[1] - z[0]) * 1e-3
@@ -248,7 +266,7 @@ def _profile_2d(fx: Fixed, M: float, h: float, z: np.ndarray, rho_g, Etag,
     I = axial(vec)
     zpk = np.array([tup.parabolic_peak(z, I[i]) for i in range(I.shape[0])])
     # lateral search at each phase's peak depth, relative to the chief ray
-    xs = np.linspace(-10, 10, 101)
+    xs = np.linspace(-25, 25, 251)
     rows = vec * np.exp(1j * (np.outer(zpk * 1e-3, kx * tan3 + kz3))).astype(np.complex64)
     Lx = np.abs(rows @ np.exp(1j * np.outer(kx, xs * 1e-3)).astype(np.complex64)) ** 4
     xoff = np.array([tup.parabolic_peak(xs, Lx[i]) for i in range(Lx.shape[0])])
@@ -318,11 +336,16 @@ def _envelope(I: np.ndarray, zpk: np.ndarray, z: np.ndarray, nsub: int = 8) -> n
 def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: False,
             progress=lambda f: None) -> Result | None:
     warn = []
+    piezo = mode.startswith("piezo")
+    precise = mode in ("precise", "piezo_precise")
     M = fx.beam_pupil_mm / p.w_tag_mm
-    Phi = 2 * fx.k0 * (p.vt_peak_D * 1e-3) / fx.k_r ** 2
+    Phi = 0.0 if piezo else 2 * fx.k0 * (p.vt_peak_D * 1e-3) / fx.k_r ** 2
     cs = np.cos(2 * np.pi * np.linspace(0, 0.5, p.n_time))
     ic0 = int(np.argmin(np.abs(cs)))
-    if p.w_tag_mm > fx.r_zero_mm:
+    # piezo: objective displacement per sample (mm, + = toward the sample); index 0 is the
+    # shallow end, like c = +1 on the TAG page
+    dh = (-p.piezo_range_um * cs * 1e-3) if piezo else None
+    if not piezo and p.w_tag_mm > fx.r_zero_mm:
         warn.append(f"TAG beam radius {p.w_tag_mm:.2f} mm exceeds the J0 first zero "
                     f"({fx.r_zero_mm:.2f} mm): the outer beam sees reversed TAG phase.")
 
@@ -337,13 +360,20 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
 
     # ---- depth grid ----
     dz_per_D = fx.n_tissue * fx.F_mm ** 2 / M ** 2              # um per dioptre (paraxial)
-    amp = dz_per_D * p.vt_peak_D / max(0.1, 1 - abs(p.tag_offset_mm) * p.vt_peak_D * 1e-3)
+    if piezo:
+        amp = fx.n_tissue * p.piezo_range_um
+    else:
+        amp = dz_per_D * p.vt_peak_D / max(0.1, 1 - abs(p.tag_offset_mm) * p.vt_peak_D * 1e-3)
     W = 1.3 * amp + 60
-    step = 0.5 if mode == "fast" else 1.0
+    step = 1.0 if precise else 0.5
     z = p.focus_depth_um + np.arange(-W, W + step, step)
 
     h = calibrate_h(p, fx)
-    rho_g, Etag = tag_field(p, fx, cs, 1024 if mode == "fast" else 2048)
+    if piezo:     # no TAG: flat Gaussian beam at the pupil, one identical row per sample
+        q = replace(p, vt_peak_D=0.0, tag_offset_mm=0.0)
+        rho_g, Etag = tag_field(q, fx, cs)
+    else:
+        rho_g, Etag = tag_field(p, fx, cs, 2048 if precise else 1024)
     delta_c = _vig_offset(fx, p.vignette_corner)
 
     nR = radii.size
@@ -352,9 +382,11 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
     lat = np.empty((nR, cs.size))         # radial lateral offset of each phase's focus, um
     pkr = np.empty((nR, cs.size))         # peak |E|^4 of each phase
 
-    if mode == "fast":
+    if not precise:
         ax = _Axial1D(fx, M)
         Ep = _interp_c(rho_g, Etag, ax.r / M)
+        if piezo:   # h -> h + dh (objective closer = focus deeper)
+            Ep = Ep * np.exp(-1j * np.outer(dh, ax.kz1))
         I = ax.I2(Ep, h, z)
         zp0 = np.array([tup.parabolic_peak(z, I[i]) for i in range(cs.size)])
         env0 = _envelope(I, zp0, z)
@@ -362,13 +394,16 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
             r_mm = r * 1e-3
             s = fx.M2 ** 2 * p.galvo_offset_mm * r_mm / fx.F_mm
             delta = delta_c * (r / r_corner if r_corner > 0 else 0)
-            fac = _pupil_factor(fx, s, delta)
+            fac = _pupil_factor(fx, s, delta)      # piezo pupil walk (<~10 um) neglected here
             u1 = np.arctan(r_mm * p.pupil_offset_mm / fx.F_mm ** 2)
             tan3 = np.tan(np.arcsin(np.sin(u1) / fx.n_tissue))
             dx1 = _shear_perturbation(fx, M, Phi, s)
             Vr[k] = env0 * fac
             zpk[k] = zp0
-            lat[k] = (zp0 - zp0[ic0]) * tan3 + dx1 * cs
+            if piezo:   # rigid translation of the cone: no lean or shear to first order
+                lat[k] = 0.0
+            else:
+                lat[k] = (zp0 - zp0[ic0]) * tan3 + dx1 * cs
             pkr[k] = I.max(axis=1) * fac
     else:
         npx = int(np.clip(np.ceil(Phi * fx.k_r / M * 0.6 * fx.R_mm / 1.5), 64, 150))
@@ -377,13 +412,15 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
                 return None
             r_mm = r * 1e-3
             s = fx.M2 ** 2 * p.galvo_offset_mm * r_mm / fx.F_mm
+            if piezo:   # the pupil moves with the objective: extra walk -dh * tan(alpha_p)
+                s = s - dh * (r_mm / fx.F_mm)
             delta = delta_c * (r / r_corner if r_corner > 0 else 0)
             u1 = np.arctan(r_mm * p.pupil_offset_mm / fx.F_mm ** 2)
             tan3 = np.tan(np.arcsin(np.sin(u1) / fx.n_tissue))
-            I, zp, xo = _profile_2d(fx, M, h, z, rho_g, Etag, u1, s, delta, npx)
+            I, zp, xo = _profile_2d(fx, M, h, z, rho_g, Etag, u1, s, delta, npx, dh)
             Vr[k] = _envelope(I, zp, z)
             zpk[k] = zp
-            lat[k] = (zp - zp[ic0]) * tan3 + (xo - xo[ic0])
+            lat[k] = (xo - xo[ic0]) if piezo else (zp - zp[ic0]) * tan3 + (xo - xo[ic0])
             pkr[k] = I.max(axis=1)
             progress((k + 1) / nR)
 
@@ -432,11 +469,14 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
     summ = {"axis": stats(0), "edge": stats(k_edge), "corner": stats(k_corner),
             "M_net": M, "dz_per_D_um": dz_per_D, "Phi_rad": Phi, "h_air_mm": h,
             "fov_x_mm": 2 * r_edge * 1e-3, "r_corner_um": r_corner, "scan": scan_metrics(fxg, fyg),
-            "radii_um": radii, "zpk": zpk, "lat": lat, "peak": pkr, "cs": cs}
+            "radii_um": radii, "zpk": zpk, "lat": lat, "peak": pkr, "cs": cs,
+            "drive": "piezo" if piezo else "tag",
+            "dz_per_um_piezo": (float((zpk[0].max() - zpk[0].min()) / (2 * p.piezo_range_um))
+                                if piezo and p.piezo_range_um > 0 else np.nan)}
     if (zpk.min() + min(0.0, p.field_curv_um)) < 0:
-        warn.append("Part of the TAG sweep lies above the tissue surface (in air); "
+        warn.append("Part of the sweep lies above the tissue surface (in air); "
                     "the model treats it as tissue, so those depths are not valid.")
-    if mode == "precise" and npx >= 150:
+    if precise and npx >= 150:
         warn.append("Pupil sampling hit its cap (150 px radius); very large V_T may alias.")
     return Result(mode, p, fxg, fyg, z, V, X, Y, Z, off, zd0, summ, warn)
 

@@ -20,6 +20,11 @@ python -m tagscan
 
 Python ≥ 3.10. Tested on Windows 11 (PySide6 6.12, PyVista 0.49).
 
+## Pages / 分頁
+
+* **TAG 掃描** — depth from the TAG lens (all parameters below).
+* **Piezo 掃描** — depth from a piezo moving the objective (no TAG). Same 3-D view, slices, export and numbers; extra parameter: piezo travel ±µm. Because the whole converging cone translates, non-telecentricity and galvo offset cause (almost) no lean or shear here — only dimming — unlike the TAG page.
+
 ## Adjustable parameters / 可調參數
 
 | # | Parameter | Meaning |

@@ -117,3 +117,34 @@ def test_mis_mounted_galvo_runs_through_model():
     s = compute(Params(beta_x_deg=90.0, beta_y_deg=90.0), "fast").summary
     assert s["scan"]["bow_um"] > 50
     assert s["edge"]["sweep"][1] - s["edge"]["sweep"][0] > 150
+
+
+def test_piezo_focus_moves_about_n_per_um():
+    s = compute(Params(piezo_range_um=100.0), "piezo_fast").summary
+    k = s["dz_per_um_piezo"]
+    assert 1.30 < k < 1.45              # ~n_tissue, nudged by depth-dependent spherical aberration
+    assert abs(s["axis"]["d0_depth"] - Params().focus_depth_um) < 0.5
+
+
+def test_piezo_small_range_matches_tag_without_power():
+    a = compute(Params(piezo_range_um=0.5), "piezo_fast").summary["axis"]
+    b = compute(Params(vt_peak_D=0.05), "fast").summary["axis"]
+    assert abs(a["d0_depth"] - b["d0_depth"]) < 0.5
+    assert abs(a["sweep"][0] - b["sweep"][0]) < 1.0
+
+
+def test_piezo_precise_equals_fast_and_is_uniform_when_aligned():
+    a = compute(Params(), "piezo_fast").summary
+    b = compute(Params(), "piezo_precise").summary
+    for k in ("axis", "edge", "corner"):
+        assert abs(b[k]["sweep"][0] - a["axis"]["sweep"][0]) < 1.0
+        assert abs(b[k]["sweep"][1] - a["axis"]["sweep"][1]) < 1.0
+        assert abs(b[k]["brightness"] - 1.0) < 0.02
+
+
+def test_piezo_has_no_shear_from_telecentricity_or_galvo_offset():
+    # the objective translates the whole converging cone: unlike TAG, no lean or shear
+    s = compute(Params(pupil_offset_mm=16.8, galvo_offset_mm=1.0), "piezo_precise").summary
+    assert abs(s["corner"]["shear_um"]) < 0.5
+    t = compute(Params(pupil_offset_mm=16.8), "precise").summary
+    assert abs(t["corner"]["shear_um"]) > 5

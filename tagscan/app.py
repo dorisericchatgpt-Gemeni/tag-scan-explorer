@@ -54,7 +54,12 @@ SPECS = [
      "整欄深度加上 S·(r/r_角落)²；+ = 角落較深。理想平場 = 0。"),
     ("vignette_corner", "+ 離軸暈影：角落光瞳保留比例", 0.3, 1.0, 0.01, 2,
      "光瞳被偏移圓裁切（貓眼形），偏移量 ∝ 視野半徑。1 = 無暈影。"),
+    ("piezo_range_um", "P. Piezo 物鏡移動範圍 ±(µm)", 5.0, 300.0, 1.0, 0,
+     "Piezo 帶物鏡上下移動的振幅。組織內焦點約移動 n × 這個值（含深度球差，非精確線性）。\n"
+     "物鏡移動時光瞳也跟著移動，光束在光瞳上的偏移已算入精確模式。"),
 ]
+TAG_ONLY = {"w_tag_mm", "tag_offset_mm", "vt_peak_D"}
+PIEZO_ONLY = {"piezo_range_um"}
 
 def fixed_text(fx: Fixed) -> str:
     """Fixed-parameter summary, generated from model.Fixed so it never goes stale."""
@@ -70,7 +75,7 @@ def fixed_text(fx: Fixed) -> str:
 
 NOTE_TEXT = (
     "<b>讀圖</b>：深色 = 可用（2P ≥ e⁻²）；淡色 = 焦點掃過但 2P < e⁻²（≥ 2% 才畫）。<br>"
-    "模型：純量 Debye 波動積分（J0 TAG、aplanatic、Fresnel、組織深度球差）。<br>"
+    "模型：純量 Debye 波動積分（{drive}、aplanatic、Fresnel、組織深度球差）。<br>"
     "快速模式：軸上精確，離軸效應為近似修正；精確模式：每個視野半徑做 2D 光瞳積分。<br>"
     "未含：散射、組織不均勻、表面傾斜、偏振、resonant 停留時間。")
 
@@ -79,14 +84,15 @@ class _Worker(QtCore.QObject):
     done = QtCore.Signal(object, int)
     prog = QtCore.Signal(float, int)
 
-    def __init__(self):
+    def __init__(self, mode):
         super().__init__()
         self.token = 0
+        self.mode = mode
 
     @QtCore.Slot(object, int)
     def run(self, p, token):
         try:
-            res = compute(p, "precise", cancel=lambda: token != self.token,
+            res = compute(p, self.mode, cancel=lambda: token != self.token,
                           progress=lambda f: self.prog.emit(f, token))
         except Exception:
             traceback.print_exc()
@@ -94,13 +100,16 @@ class _Worker(QtCore.QObject):
         self.done.emit(res, token)
 
 
-class MainWindow(QtWidgets.QMainWindow):
+class ScanPage(QtWidgets.QWidget):
+    """One scan page. kind = "tag" (depth from the TAG lens) or "piezo" (depth from a
+    piezo moving the objective, no TAG)."""
     request_precise = QtCore.Signal(object, int)
 
-    def __init__(self):
+    def __init__(self, kind: str = "tag"):
         super().__init__()
-        self.setWindowTitle("TAG 掃描體積 Explorer")
-        self.resize(1700, 980)
+        self.kind = kind
+        self.fast_mode = "fast" if kind == "tag" else "piezo_fast"
+        self.prec_mode = "precise" if kind == "tag" else "piezo_precise"
         self.p = Params()
         self.res = None
         self.token = 0
@@ -111,7 +120,14 @@ class MainWindow(QtWidgets.QMainWindow):
         lv = QtWidgets.QVBoxLayout(left)
         form = QtWidgets.QGridLayout()
         self.spins = {}
-        for row, (attr, label, lo, hi, step, dec, tip) in enumerate(SPECS):
+        skip = PIEZO_ONLY if kind == "tag" else TAG_ONLY
+        specs = [sp_ for sp_ in SPECS if sp_[0] not in skip]
+        if kind == "piezo":                      # put the depth driver first
+            specs = ([sp_ for sp_ in specs if sp_[0] in PIEZO_ONLY]
+                     + [sp_ for sp_ in specs if sp_[0] not in PIEZO_ONLY])
+        for row, (attr, label, lo, hi, step, dec, tip) in enumerate(specs):
+            if kind == "piezo" and attr == "focus_depth_um":
+                label = "7. Piezo 在 0 時焦點在組織表面下 (µm)"
             lab = QtWidgets.QLabel(label)
             lab.setToolTip(tip)
             sp = QtWidgets.QDoubleSpinBox()
@@ -175,7 +191,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotter = QtInteractor(centre)
         self.plotter.set_background("white")
         cv.addWidget(self.plotter.interactor, 1)
-        note = QtWidgets.QLabel(NOTE_TEXT); note.setWordWrap(True)
+        note = QtWidgets.QLabel(NOTE_TEXT.format(
+            drive="J0 TAG" if kind == "tag" else "Piezo 移動物鏡、無 TAG")); note.setWordWrap(True)
         cv.addWidget(note)
 
         # ---------------- right: slice + numbers
@@ -205,7 +222,9 @@ class MainWindow(QtWidgets.QMainWindow):
         split = QtWidgets.QSplitter()
         split.addWidget(scroll); split.addWidget(centre); split.addWidget(right)
         split.setSizes([380, 820, 520])
-        self.setCentralWidget(split)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(split)
 
         # ---------------- timers and worker thread
         self.t_fast = QtCore.QTimer(self, singleShot=True, interval=60)
@@ -213,7 +232,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t_prec = QtCore.QTimer(self, singleShot=True, interval=700)
         self.t_prec.timeout.connect(self._run_precise)
         self.thread = QtCore.QThread(self)
-        self.worker = _Worker()
+        self.worker = _Worker(self.prec_mode)
         self.worker.moveToThread(self.thread)
         self.request_precise.connect(self.worker.run)
         self.worker.done.connect(self._precise_done)
@@ -237,7 +256,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _run_fast(self):
         try:
-            self.res = compute(self.p, "fast")
+            self.res = compute(self.p, self.fast_mode)
         except Exception as e:
             self.status.setText(f"<span style='color:red'>計算錯誤：{e}</span>")
             traceback.print_exc()
@@ -323,6 +342,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _numbers(self):
         s = self.res.summary
 
+        piezo = self.kind == "piezo"
+
         def row(name, d):
             sw, us = d["sweep"], d["usable"]
             uu = (f"{us[0]:.0f}–{us[1]:.0f}（{us[1]-us[0]:.0f}）" if np.isfinite(us[0]) else "無")
@@ -331,15 +352,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"<td>{d['shear_um']:+.2f}</td></tr>")
 
         html = ("<table cellspacing=4><tr><th></th><th>主峰掃描 µm</th><th>可用 µm</th>"
-                "<th>D=0 µm</th><th>相對亮度</th><th>頂−底橫移 µm</th></tr>"
+                f"<th>{'Piezo=0' if piezo else 'D=0'} µm</th><th>相對亮度</th><th>頂−底橫移 µm</th></tr>"
                 + row("軸上", s["axis"]) + row("邊緣", s["edge"]) + row("角落", s["corner"]) + "</table>"
-                f"M_net {s['M_net']:.2f}；近軸每 D {s['dz_per_D_um']:.2f} µm；"
-                f"TAG 相位振幅 {s['Phi_rad']:.0f} rad<br>"
+                + (f"Piezo ±{self.p.piezo_range_um:.0f} µm → 組織內每 µm 物鏡移動 "
+                   f"{s['dz_per_um_piezo']:.3f} µm（軸上平均）<br>" if piezo else
+                   f"M_net {s['M_net']:.2f}；近軸每 D {s['dz_per_D_um']:.2f} µm；"
+                   f"TAG 相位振幅 {s['Phi_rad']:.0f} rad<br>") +
                 f"<b>掃描範圍</b> {s['scan']['width_mm']:.2f} × {s['scan']['height_mm']:.2f} mm（外框）；"
                 f"快軸線長 {s['scan']['fast_line_mm']:.2f} mm、旋轉 {s['scan']['rotation_deg']:.1f}°、"
                 f"最大弓形 {s['scan']['bow_um']:.0f} µm<br>"
-                "深度 = 組織表面下；頂−底橫移 = c=+1（淺端）減 c=−1（深端）的徑向位置，"
-                "負值 = 淺端偏向中心。")
+                "深度 = 組織表面下；頂−底橫移 = 淺端減深端的徑向位置，負值 = 淺端偏向中心。"
+                + ("<br>Piezo 移動的是整個物鏡，光錐整體平移：非遠心與 galvo 錯位在這裡幾乎不造成"
+                   "傾斜或剪切（和 TAG 不同），只影響亮度。" if piezo else ""))
         for w in self.res.warnings:
             html += f"<br><span style='color:#c00'>⚠ {w}</span>"
         self.nums.setText(html)
@@ -437,10 +461,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if fn:
             self.plotter.screenshot(fn, scale=2)
 
-    def closeEvent(self, ev):
+    def shutdown(self):
         self.worker.token = -1
         self.thread.quit(); self.thread.wait(10000)
         self.plotter.close()
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("TAG 掃描體積 Explorer")
+        self.resize(1700, 980)
+        self.tabs = QtWidgets.QTabWidget()
+        self.pages = {"tag": ScanPage("tag"), "piezo": ScanPage("piezo")}
+        self.tabs.addTab(self.pages["tag"], "TAG 掃描")
+        self.tabs.addTab(self.pages["piezo"], "Piezo 掃描")
+        self.setCentralWidget(self.tabs)
+
+    def closeEvent(self, ev):
+        for pg in self.pages.values():
+            pg.shutdown()
         super().closeEvent(ev)
 
 
