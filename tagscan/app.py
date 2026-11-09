@@ -56,13 +56,17 @@ SPECS = [
      "光瞳被偏移圓裁切（貓眼形），偏移量 ∝ 視野半徑。1 = 無暈影。"),
 ]
 
-FIXED_TEXT = (
-    "<b>固定參數</b><br>"
-    "λ 0.92 µm；物鏡 F 16.8 mm、空氣、光瞳 R 10 mm、NA 0.595<br>"
-    "入物鏡光束 1/e² 半徑 10 mm；組織 n 1.36<br>"
-    "TAG 190 kHz、聲速 980 m/s（J0 第一零點 1.97 mm）<br>"
-    "galvo ±14° 光學角，M₂ 4，X→1:1 relay→Y（各自與光瞳共軛）<br>"
-    "可用 = 2P 峰值 ≥ e⁻² (13.5%) × 全體積最亮點")
+def fixed_text(fx: Fixed) -> str:
+    """Fixed-parameter summary, generated from model.Fixed so it never goes stale."""
+    return (
+        "<b>固定參數</b>（在 model.py 的 Fixed 修改）<br>"
+        f"λ {fx.wavelength_um:g} µm；物鏡 F {fx.F_mm:g} mm、空氣、光瞳 R {fx.R_mm:g} mm、"
+        f"NA {fx.R_mm / fx.F_mm:.3f}<br>"
+        f"入物鏡光束 1/e² 半徑 {fx.beam_pupil_mm:g} mm；組織 n {fx.n_tissue:g}<br>"
+        f"TAG {fx.tag_freq_hz / 1e3:g} kHz、聲速 {fx.sound_speed_m_s:g} m/s"
+        f"（J0 第一零點 {fx.r_zero_mm:.2f} mm）<br>"
+        f"galvo ±{fx.galvo_optical_deg:g}° 光學角，M₂ {fx.M2:g}，X→1:1 relay→Y（各自與光瞳共軛）<br>"
+        f"可用 = 2P 峰值 ≥ e⁻² ({THR:.1%}) × 全體積最亮點")
 
 NOTE_TEXT = (
     "<b>讀圖</b>：深色 = 可用（2P ≥ e⁻²）；淡色 = 焦點掃過但 2P < e⁻²（≥ 2% 才畫）。<br>"
@@ -148,7 +152,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dg.addRow("橫向偏移顯示放大 ×", self.exag)
         dg.addRow("3D 深度顯示放大 ×", self.zsc)
         lv.addWidget(disp)
-        fixed = QtWidgets.QLabel(FIXED_TEXT); fixed.setWordWrap(True)
+        fixed = QtWidgets.QLabel(fixed_text(Fixed())); fixed.setWordWrap(True)
         lv.addWidget(fixed)
         lv.addStretch(1)
         scroll = QtWidgets.QScrollArea(); scroll.setWidget(left); scroll.setWidgetResizable(True)

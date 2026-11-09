@@ -34,7 +34,7 @@ Python ≥ 3.10. Tested on Windows 11 (PySide6 6.12, PyVista 0.49).
 | + | field curvature | corner sag of the objective's focal surface |
 | + | vignetting | fraction of the pupil kept at the field corner |
 
-Fixed: λ 0.92 µm; objective F 16.8 mm, air, pupil radius 10 mm (NA 0.595); beam 1/e² radius 10 mm at the pupil; tissue n 1.36; TAG 190 kHz, sound speed 980 m/s; galvo ±14° optical, scan/tube-lens magnification 4; usable threshold e⁻².
+Fixed (edit `Fixed` in `tagscan/model.py`; the GUI panel reads it): λ 0.94 µm; objective F 16.8 mm, air, pupil radius 10 mm (NA 0.595); beam 1/e² radius 10 mm at the pupil; tissue n 1.36; TAG 190 kHz, sound speed 980 m/s; galvo ±14° optical, scan/tube-lens magnification 4; usable threshold e⁻².
 
 ## Model / 模型
 

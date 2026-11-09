@@ -48,7 +48,7 @@ THR = float(np.exp(-2))          # usable threshold: e^-2 of the global brightes
 # =============================================================================
 @dataclass(frozen=True)
 class Fixed:
-    wavelength_um: float = 0.92
+    wavelength_um: float = 0.94
     F_mm: float = 16.8               # objective focal length
     R_mm: float = 10.0               # objective pupil radius (air objective, NA 0.595)
     beam_pupil_mm: float = 10.0      # 1/e^2 beam radius at the objective pupil
