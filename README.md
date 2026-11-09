@@ -9,7 +9,7 @@ Interactive desktop tool for the volume swept by the two-photon focus of a **TAG
 ## Install / 安裝
 
 ```bash
-git clone https://github.com/<owner>/tag-scan-explorer.git
+git clone https://github.com/dorisericchatgpt-Gemeni/tag-scan-explorer.git
 cd tag-scan-explorer
 python -m venv .venv
 .venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
