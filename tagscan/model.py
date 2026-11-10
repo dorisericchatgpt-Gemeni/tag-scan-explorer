@@ -10,8 +10,9 @@ extended with the knobs of the explorer:
      laser side of that plane, so the TAG field propagates +d before being relayed)
   3  peak TAG power V_T (dioptres)
   4  galvo rotation-axis tilt (scan bow)            -> scanner.py
-  5  galvo offset dg from the pupil-conjugate plane -> beam walks s = M2^2 dg tan(a_p) on
-     the pupil: off-centre TAG phase (shear) + clipping (dimming)
+  5  galvo offset dg from the pupil-conjugate plane (X and Y mirrors separately) -> beam
+     walks s = M2^2 dg tan(a_p) on the pupil: off-centre TAG phase (shear) + clipping
+     (dimming)
   6  entrance-pupil offset e from the objective's front focal plane (0 = telecentric):
      sample-side chief-ray angle u = atan(r e / F^2) -> scan lines lean, magnification
      changes with depth, the tilted cone crosses the flat interface obliquely
@@ -25,9 +26,13 @@ Two modes:
   precise : 2-D pupil integral at several field radii (tilted cone, decentred TAG phase,
             clipped pupil), all from the same wave model
 
-All off-axis effects are radially symmetric (pupil walk, chief-ray tilt, vignetting and
-field curvature all point along the field radius), so the 2-D work is done on a set of
-field radii and interpolated; galvo bow only moves where each field point lands.
+Chief-ray tilt, vignetting and field curvature point along the field radius, and so does
+the pupil walk when both galvos have the same offset, so the 2-D work is done on a set
+of field radii and interpolated; galvo bow only moves where each field point lands. If
+the two galvo offsets differ, one set of radial profiles is computed per mirror and they
+are blended per field point by the radial part of the walk (exact to first order in the
+walk for the shear, second order for the dimming); the part of the walk perpendicular
+to the radius adds a geometric tangential shear.
 
 Depth z is in micrometres below the tissue surface; optical lengths are in mm.
 """
@@ -79,7 +84,8 @@ class Params:
     beta_x_deg: float = 0.0
     beta_y_deg: float = 0.0
     galvo_incidence_deg: float = 45.0
-    galvo_offset_mm: float = 0.0
+    galvo_offset_mm: float = 0.0             # X galvo off its pupil-conjugate plane
+    galvo_offset_y_mm: float = 0.0           # Y galvo, same
     pupil_offset_mm: float = 0.0             # e; 0 = telecentric, F = stop at the lens
     focus_depth_um: float = 279.6            # D0 (current lab geometry, L2 = 9.8 mm)
     field_curv_um: float = 0.0               # corner sag, + = deeper
@@ -104,6 +110,8 @@ class Result:
     zd0: np.ndarray           # (n, n) depth of the c = 0 focus (D = 0 surface), um
     summary: dict
     warnings: list = field(default_factory=list)
+    Vavg: np.ndarray = None   # (n, n, nz) normalised time average of |E|^4 over the sweep
+    offt: np.ndarray = None   # (n, n, nz) lateral offset perpendicular to the field radius, um
 
 
 # =============================================================================
@@ -316,6 +324,20 @@ def _shear_perturbation(fx: Fixed, M: float, Phi: float, s: float) -> float:
     return -g * fx.F_mm / fx.k0 * 1e3
 
 
+def _time_average(I: np.ndarray, zpk: np.ndarray, z: np.ndarray, nsub: int = 8) -> np.ndarray:
+    """Mean of |E|^4 over a CONTINUOUS TAG sweep (phases are uniform in time, so this is
+    the 2P signal generated at each depth per TAG period: it includes the longer dwell at
+    the two ends of the sinusoidal sweep). Same in-between interpolation as _envelope."""
+    acc = np.zeros(z.size)
+    for i in range(len(zpk) - 1):
+        dz = zpk[i + 1] - zpk[i]
+        for t in (np.arange(nsub) + 0.5) / nsub:
+            a = np.interp(z - t * dz, z, I[i], left=0, right=0)
+            b = np.interp(z + (1 - t) * dz, z, I[i + 1], left=0, right=0)
+            acc += (1 - t) * a + t * b
+    return acc / ((len(zpk) - 1) * nsub)
+
+
 def _envelope(I: np.ndarray, zpk: np.ndarray, z: np.ndarray, nsub: int = 8) -> np.ndarray:
     """max over a CONTINUOUS TAG sweep. The sampled phases are ~10 um apart near the sweep
     centre, more than the axial PSF, so max over samples alone leaves dark stripes. Between
@@ -377,109 +399,172 @@ def compute(p: Params, mode: str = "fast", fx: Fixed = Fixed(), cancel=lambda: F
     delta_c = _vig_offset(fx, p.vignette_corner)
 
     nR = radii.size
-    Vr = np.empty((nR, z.size))
-    zpk = np.empty((nR, cs.size))
-    lat = np.empty((nR, cs.size))         # radial lateral offset of each phase's focus, um
-    pkr = np.empty((nR, cs.size))         # peak |E|^4 of each phase
-
     if not precise:
         ax = _Axial1D(fx, M)
         Ep = _interp_c(rho_g, Etag, ax.r / M)
         if piezo:   # h -> h + dh (objective closer = focus deeper)
             Ep = Ep * np.exp(-1j * np.outer(dh, ax.kz1))
-        I = ax.I2(Ep, h, z)
-        zp0 = np.array([tup.parabolic_peak(z, I[i]) for i in range(cs.size)])
-        env0 = _envelope(I, zp0, z)
-        for k, r in enumerate(radii):
-            r_mm = r * 1e-3
-            s = fx.M2 ** 2 * p.galvo_offset_mm * r_mm / fx.F_mm
-            delta = delta_c * (r / r_corner if r_corner > 0 else 0)
-            fac = _pupil_factor(fx, s, delta)      # piezo pupil walk (<~10 um) neglected here
-            u1 = np.arctan(r_mm * p.pupil_offset_mm / fx.F_mm ** 2)
-            tan3 = np.tan(np.arcsin(np.sin(u1) / fx.n_tissue))
-            dx1 = _shear_perturbation(fx, M, Phi, s)
-            Vr[k] = env0 * fac
-            zpk[k] = zp0
-            if piezo:   # rigid translation of the cone: no lean or shear to first order
-                lat[k] = 0.0
-            else:
-                lat[k] = (zp0 - zp0[ic0]) * tan3 + dx1 * cs
-            pkr[k] = I.max(axis=1) * fac
-    else:
-        npx = int(np.clip(np.ceil(Phi * fx.k_r / M * 0.6 * fx.R_mm / 1.5), 64, 150))
+        I0 = ax.I2(Ep, h, z)
+        zp0 = np.array([tup.parabolic_peak(z, I0[i]) for i in range(cs.size)])
+        env0 = _envelope(I0, zp0, z)
+        avg0 = _time_average(I0, zp0, z)
+
+    def nodes(dg, f0, f1):
+        """Profiles on the field radii for a scanner whose X and Y galvos are both dg off
+        their conjugate planes (beam walk along the field radius)."""
+        Vr = np.empty((nR, z.size))
+        Ar = np.empty((nR, z.size))       # time average over the sweep
+        zpk = np.empty((nR, cs.size))
+        lat = np.empty((nR, cs.size))     # radial lateral offset of each phase's focus, um
+        pkr = np.empty((nR, cs.size))     # peak |E|^4 of each phase
         for k, r in enumerate(radii):
             if cancel():
                 return None
             r_mm = r * 1e-3
-            s = fx.M2 ** 2 * p.galvo_offset_mm * r_mm / fx.F_mm
-            if piezo:   # the pupil moves with the objective: extra walk -dh * tan(alpha_p)
-                s = s - dh * (r_mm / fx.F_mm)
+            s = fx.M2 ** 2 * dg * r_mm / fx.F_mm
             delta = delta_c * (r / r_corner if r_corner > 0 else 0)
             u1 = np.arctan(r_mm * p.pupil_offset_mm / fx.F_mm ** 2)
             tan3 = np.tan(np.arcsin(np.sin(u1) / fx.n_tissue))
-            I, zp, xo = _profile_2d(fx, M, h, z, rho_g, Etag, u1, s, delta, npx, dh)
-            Vr[k] = _envelope(I, zp, z)
-            zpk[k] = zp
-            lat[k] = (xo - xo[ic0]) if piezo else (zp - zp[ic0]) * tan3 + (xo - xo[ic0])
-            pkr[k] = I.max(axis=1)
-            progress((k + 1) / nR)
+            if not precise:
+                fac = _pupil_factor(fx, s, delta)      # piezo pupil walk (<~10 um) neglected here
+                Vr[k] = env0 * fac
+                Ar[k] = avg0 * fac
+                zpk[k] = zp0
+                if piezo:   # rigid translation of the cone: no lean or shear to first order
+                    lat[k] = 0.0
+                else:
+                    lat[k] = (zp0 - zp0[ic0]) * tan3 + _shear_perturbation(fx, M, Phi, s) * cs
+                pkr[k] = I0.max(axis=1) * fac
+            else:
+                if piezo:   # the pupil moves with the objective: extra walk -dh * tan(alpha_p)
+                    s = s - dh * (r_mm / fx.F_mm)
+                I, zp, xo = _profile_2d(fx, M, h, z, rho_g, Etag, u1, s, delta, npx, dh)
+                Vr[k] = _envelope(I, zp, z)
+                Ar[k] = _time_average(I, zp, z)
+                zpk[k] = zp
+                lat[k] = (xo - xo[ic0]) if piezo else (zp - zp[ic0]) * tan3 + (xo - xo[ic0])
+                pkr[k] = I.max(axis=1)
+                progress(f0 + (f1 - f0) * (k + 1) / nR)
+        return Vr, Ar, zpk, lat, pkr
 
-    gmax = Vr.max()
-    Vr /= gmax
-    pkr /= gmax
+    if precise:
+        npx = int(np.clip(np.ceil(Phi * fx.k_r / M * 0.6 * fx.R_mm / 1.5), 64, 150))
+    # X and Y galvo offsets: one family of radial profiles per mirror, blended per field point
+    dgx, dgy = p.galvo_offset_mm, p.galvo_offset_y_mm
+    same = abs(dgy - dgx) < 1e-9
+    fa = nodes(dgx, 0.0, 1.0 if same else 0.5)
+    if fa is None:
+        return None
+    fb = fa if same else nodes(dgy, 0.5, 1.0)
+    if fb is None:
+        return None
+    gmax = max(fa[0].max(), fb[0].max())
+    amax = max(fa[1].max(), fb[1].max())
 
-    # lateral offset as a function of depth, per radius (from the focus at that depth)
-    offr = np.empty_like(Vr)
-    for k in range(nR):
-        o = np.argsort(zpk[k])
-        offr[k] = np.interp(z, zpk[k][o], lat[k][o])
+    def norm(f):
+        Vr, Ar, zpk, lat, pkr = f
+        offr = np.empty_like(Vr)      # lateral offset as a function of depth, per radius
+        for k in range(nR):
+            o = np.argsort(zpk[k])
+            offr[k] = np.interp(z, zpk[k][o], lat[k][o])
+        return {"V": Vr / gmax, "A": Ar / amax, "zpk": zpk, "lat": lat, "pk": pkr / gmax, "off": offr}
+
+    fa = norm(fa)
+    fb = fa if same else norm(fb)
 
     # ---- assemble the volume on the field grid ----
     n = p.n_field
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ux = np.where(rf > 0, fxg / rf, 0.0)
+        uy = np.where(rf > 0, fyg / rf, 0.0)
+    # beam walk on the pupil (mm): each mirror contributes its own deflection times its offset
+    tXx, tXy = tanpx[:, [c_]], tanpy[:, [c_]]                 # X galvo alone (Y at rest)
+    sx = fx.M2 ** 2 * (dgx * tXx + dgy * (tanpx - tXx))
+    sy = fx.M2 ** 2 * (dgx * tXy + dgy * (tanpy - tXy))
+    s_r, s_t = sx * ux + sy * uy, -sx * uy + sy * ux          # radial / tangential parts
+    if same:
+        wB = np.zeros_like(rf)
+    else:   # radial walk = that of a scanner with both mirrors at dg_eff
+        with np.errstate(invalid="ignore", divide="ignore"):
+            dg_eff = np.where(rf > 0, s_r * fx.F_mm / (fx.M2 ** 2 * rf * 1e-3), dgx)
+        wB = np.clip((dg_eff - dgx) / (dgy - dgx), 0.0, 1.0)
     wgt = np.clip(np.interp(rf.ravel(), radii, np.arange(nR)), 0, nR - 1)
     i0 = np.floor(wgt).astype(int)
     i1 = np.minimum(i0 + 1, nR - 1)
     t = (wgt - i0)[:, None]
-    V = ((1 - t) * Vr[i0] + t * Vr[i1]).reshape(n, n, -1)
-    off = ((1 - t) * offr[i0] + t * offr[i1]).reshape(n, n, -1)
-    zd0 = ((1 - t[:, 0]) * zpk[i0, ic0] + t[:, 0] * zpk[i1, ic0]).reshape(n, n)
+
+    def onfield(a, b):
+        ra = ((1 - t) * a[i0] + t * a[i1]).reshape(n, n, -1)
+        if same:
+            return ra
+        rb = ((1 - t) * b[i0] + t * b[i1]).reshape(n, n, -1)
+        return (1 - wB[..., None]) * ra + wB[..., None] * rb
+
+    V = onfield(fa["V"], fb["V"])
+    Vavg = onfield(fa["A"], fb["A"])
+    off = onfield(fa["off"], fb["off"])
+    zd0 = onfield(fa["zpk"][:, [ic0]], fb["zpk"][:, [ic0]])[..., 0]
+    # tangential shear (only when the two mirrors have different offsets): the focus moves
+    # along the line tilted by s_t / F in air, refracted into the tissue
+    if piezo:
+        tan3t = np.zeros_like(rf)
+    else:
+        tan3t = np.tan(np.arcsin(np.sin(np.arctan(s_t / fx.F_mm)) / fx.n_tissue))
+    offt = (z[None, None, :] - zd0[..., None]) * tan3t[..., None]
     fc = p.field_curv_um * (rf / r_corner) ** 2 if r_corner > 0 else np.zeros_like(rf)
     zd0 = zd0 + fc
-    with np.errstate(invalid="ignore", divide="ignore"):
-        ux = np.where(rf > 0, fxg / rf, 0.0)
-        uy = np.where(rf > 0, fyg / rf, 0.0)
-    X = fxg[..., None] + off * ux[..., None]
-    Y = fyg[..., None] + off * uy[..., None]
+    X = fxg[..., None] + off * ux[..., None] - offt * uy[..., None]
+    Y = fyg[..., None] + off * uy[..., None] + offt * ux[..., None]
     Z = z[None, None, :] + fc[..., None]
 
     # ---- summary ----
-    def stats(k):
-        ok = pkr[k] >= THR
+    tf = np.linspace(0, cs.size - 1, 20 * (cs.size - 1) + 1)   # sub-sample the TAG phases
+
+    def stats(k, w=0.0, tan_t=0.0):
+        zp = (1 - w) * fa["zpk"][k] + w * fb["zpk"][k]
+        la = (1 - w) * fa["lat"][k] + w * fb["lat"][k]
+        pk = (1 - w) * fa["pk"][k] + w * fb["pk"][k]
+        zf = np.interp(tf, np.arange(cs.size), zp)
+        ok = np.interp(tf, np.arange(cs.size), pk) >= THR      # threshold crossing interpolated
         fck = p.field_curv_um * (radii[k] / r_corner) ** 2 if r_corner > 0 else 0.0
-        d = {"sweep": (zpk[k].min() + fck, zpk[k].max() + fck),
-             "usable": ((zpk[k][ok].min() + fck, zpk[k][ok].max() + fck) if ok.any() else (np.nan, np.nan)),
-             "brightness": float(pkr[k].max()),
-             "shear_um": float(lat[k][0] - lat[k][-1]),       # c = +1 (shallow) minus c = -1 (deep)
-             "d0_depth": float(zpk[k][ic0] + fck)}
+        d = {"sweep": (zp.min() + fck, zp.max() + fck),
+             "usable": ((zf[ok].min() + fck, zf[ok].max() + fck) if ok.any() else (np.nan, np.nan)),
+             "brightness": float(pk.max()),
+             "shear_um": float(la[0] - la[-1]),               # c = +1 (shallow) minus c = -1 (deep)
+             "shear_t_um": float((zp[0] - zp[-1]) * tan_t),   # same, perpendicular to the radius
+             "d0_depth": float(zp[ic0] + fck)}
         d["centre"] = 0.5 * (d["sweep"][0] + d["sweep"][1])
         d["usable_centre"] = 0.5 * (d["usable"][0] + d["usable"][1])
         return d
 
     k_edge = int(np.argmin(np.abs(radii - r_edge)))
     k_corner = int(np.argmin(np.abs(radii - r_corner)))
-    summ = {"axis": stats(0), "edge": stats(k_edge), "corner": stats(k_corner),
+    ci, cj = max(((i, j) for i in (0, -1) for j in (0, -1)), key=lambda ij: rf[ij])
+    # 2P peak of the D = 0 focus relative to the same beam with no index-mismatch aberration
+    ax0 = _Axial1D(fx, M)
+    Ep0 = np.exp(-(ax0.r / fx.beam_pupil_mm) ** 2)[None, :]
+    sa = float(ax0.I2(Ep0, h, p.focus_depth_um + np.linspace(-80, 80, 641)).max()
+               / np.abs((Ep0[0] * ax0.w).sum()) ** 4)
+    zall = np.r_[fa["zpk"].ravel(), fb["zpk"].ravel()]
+    summ = {"axis": stats(0), "edge": stats(k_edge),
+            "corner": stats(k_corner, float(wB[ci, cj]), float(tan3t[ci, cj])),
             "M_net": M, "dz_per_D_um": dz_per_D, "Phi_rad": Phi, "h_air_mm": h,
             "fov_x_mm": 2 * r_edge * 1e-3, "r_corner_um": r_corner, "scan": scan_metrics(fxg, fyg),
-            "radii_um": radii, "zpk": zpk, "lat": lat, "peak": pkr, "cs": cs,
+            "radii_um": radii, "zpk": fa["zpk"], "lat": fa["lat"], "peak": fa["pk"], "cs": cs,
+            "sa_2p_ratio": sa,
             "drive": "piezo" if piezo else "tag",
-            "dz_per_um_piezo": (float((zpk[0].max() - zpk[0].min()) / (2 * p.piezo_range_um))
+            "dz_per_um_piezo": (float((fa["zpk"][0].max() - fa["zpk"][0].min()) / (2 * p.piezo_range_um))
                                 if piezo and p.piezo_range_um > 0 else np.nan)}
-    if (zpk.min() + min(0.0, p.field_curv_um)) < 0:
+    if sa < 0.5:
+        warn.append(f"Air->tissue spherical aberration: the 2P peak of the {'piezo = 0' if piezo else 'D = 0'} "
+                    f"focus is {sa:.0%} of the aberration-free value. The model has no cover glass, "
+                    "window or correction collar, so where the usable range sits depends on this.")
+    if (zall.min() + min(0.0, p.field_curv_um)) < 0:
         warn.append("Part of the sweep lies above the tissue surface (in air); "
                     "the model treats it as tissue, so those depths are not valid.")
     if precise and npx >= 150:
         warn.append("Pupil sampling hit its cap (150 px radius); very large V_T may alias.")
-    return Result(mode, p, fxg, fyg, z, V, X, Y, Z, off, zd0, summ, warn)
+    return Result(mode, p, fxg, fyg, z, V, X, Y, Z, off, zd0, summ, warn, Vavg=Vavg, offt=offt)
 
 
 def centroid_shift(p: Params, fx: Fixed = Fixed()) -> tuple[float, float]:

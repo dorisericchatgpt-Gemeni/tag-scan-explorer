@@ -26,7 +26,11 @@ def test_fast_matches_tag_unified_on_axis(ref_axis):
     s = compute(Params(), "fast").summary["axis"]
     assert abs(s["sweep"][0] - zp.min()) < 3.0
     assert abs(s["sweep"][1] - zp.max()) < 1.5
-    assert abs(s["usable"][0] - zp[ok].min()) < 1.5
+    # the usable end is interpolated between phases: it must fall between the reference's
+    # last sample below threshold and its first sample above
+    first_ok = zp[ok].min()
+    last_dim = zp[~ok & (zp < first_ok)].max()
+    assert last_dim - 1.5 < s["usable"][0] < first_ok + 1.5
     assert abs(s["d0_depth"] - Params().focus_depth_um) < 0.5
 
 
@@ -41,8 +45,8 @@ def test_precise_equals_fast_on_axis():
 
 def test_galvo_shear():
     # independent 2-D wave calculation (FFT pupil, homogeneous tissue): -0.80 um per 0.1 mm at the edge
-    pr = compute(Params(galvo_offset_mm=0.3), "precise").summary
-    fa = compute(Params(galvo_offset_mm=0.3), "fast").summary
+    pr = compute(Params(galvo_offset_mm=0.3, galvo_offset_y_mm=0.3), "precise").summary
+    fa = compute(Params(galvo_offset_mm=0.3, galvo_offset_y_mm=0.3), "fast").summary
     assert pr["edge"]["shear_um"] == pytest.approx(-2.4, abs=0.3)
     assert fa["edge"]["shear_um"] == pytest.approx(pr["edge"]["shear_um"], rel=0.2)
     assert pr["corner"]["shear_um"] < pr["edge"]["shear_um"] < 0     # grows with field radius
@@ -148,3 +152,48 @@ def test_piezo_has_no_shear_from_telecentricity_or_galvo_offset():
     assert abs(s["corner"]["shear_um"]) < 0.5
     t = compute(Params(pupil_offset_mm=16.8), "precise").summary
     assert abs(t["corner"]["shear_um"]) > 5
+
+
+def test_only_x_galvo_offset_shears_along_x():
+    # with only the X mirror misplaced the beam walks along x everywhere, so the shear at
+    # the corner is the edge shear along x and nothing along y; the Y edge is unaffected
+    r = compute(Params(galvo_offset_mm=0.3), "precise")
+    s = r.summary
+    c = r.fx.shape[0] // 2
+    it, ib = (int(np.argmin(np.abs(r.z - q))) for q in s["axis"]["sweep"])
+
+    def shear(i, j):
+        dx, dy = r.X[i, j] - r.fx[i, j], r.Y[i, j] - r.fy[i, j]
+        return dx[it] - dx[ib], dy[it] - dy[ib]
+
+    ex, ey = shear(-1, c)
+    assert ex == pytest.approx(s["edge"]["shear_um"], abs=0.15) and abs(ey) < 0.05
+    assert max(abs(v) for v in shear(c, -1)) < 0.05
+    cx, cy = shear(-1, -1)
+    assert cx == pytest.approx(ex, rel=0.1) and abs(cy) < 0.2
+    assert abs(s["corner"]["shear_t_um"]) > 1.0
+
+
+def test_usable_range_does_not_depend_on_phase_sampling():
+    a = compute(Params(n_time=25), "fast").summary["axis"]["usable"]
+    b = compute(Params(n_time=201), "fast").summary["axis"]["usable"]
+    assert abs(a[0] - b[0]) < 1.5 and abs(a[1] - b[1]) < 1.5
+
+
+def test_time_average_weights_the_sweep_ends():
+    r = compute(Params(focus_depth_um=50.0), "fast")      # little aberration: clean comparison
+    c = r.fx.shape[0] // 2
+    V, A = r.V[c, c], r.Vavg[c, c]
+    assert A.max() == pytest.approx(1.0)
+    mid = int(np.argmin(np.abs(r.z - 50.0)))
+    end = int(np.argmin(np.abs(r.z - r.summary["axis"]["usable"][1])))
+    assert A[end] / A[mid] > 1.5 * V[end] / V[mid]       # longer dwell at the turning point
+
+
+def test_spherical_aberration_ratio_and_warning():
+    deep = compute(Params(), "fast")
+    shallow = compute(Params(focus_depth_um=50.0), "fast")
+    assert deep.summary["sa_2p_ratio"] == pytest.approx(0.18, abs=0.03)
+    assert shallow.summary["sa_2p_ratio"] > 0.8
+    assert any("spherical aberration" in w for w in deep.warnings)
+    assert not any("spherical aberration" in w for w in shallow.warnings)

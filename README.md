@@ -33,7 +33,7 @@ Python ≥ 3.10. Tested on Windows 11 (PySide6 6.12, PyVista 0.49).
 | 2 | TAG offset d | TAG lens displaced from the plane conjugate to the pupil (TAG space; d > 0 = laser side) |
 | 3 | TAG power ±V_T | peak optical power in dioptres |
 | 4 | galvo axis tilt β_x, β_y (+ incidence angle) | rotation axis not perpendicular to the plane of incidence → scan bow |
-| 5 | galvo offset Δg | galvo off its pupil-conjugate plane → beam walks on the pupil (shear + dimming) |
+| 5 | galvo offsets Δg_x, Δg_y | each galvo off its pupil-conjugate plane → beam walks on the pupil (shear + dimming). If the two differ, the shear is no longer radial |
 | 6 | entrance-pupil offset e | 0 = telecentric; F = stop at the lens → chief-ray tilt (scan lines lean) |
 | 7 | depth of the D = 0 focus | below the tissue surface; sets the depth-dependent spherical aberration |
 | + | field curvature | corner sag of the objective's focal surface |
@@ -45,7 +45,7 @@ Fixed (edit `Fixed` in `tagscan/model.py`; the GUI panel reads it): λ 0.94 µm;
 
 Scalar Debye wave integral (`tagscan/tag_unified_psf.py`, extended in `tagscan/model.py`): Gaussian beam, true J0 TAG phase, aplanatic √cos weighting, air→tissue Fresnel transmission, propagation with k_z in tissue (depth-dependent spherical aberration included).
 
-* **Fast mode** (while dragging, ~0.3 s): exact 1-D radial integral on axis; off-axis effects are corrections (lean from the chief-ray angle, shear from a first-order perturbation of the decentred TAG phase, dimming from pupil integrals).
+* **Fast mode** (while dragging, ~0.3 s): exact 1-D radial integral on axis; off-axis effects are corrections (lean from the chief-ray angle, shear from a first-order perturbation of the decentred TAG phase, dimming from pupil integrals). The shear is within about 10 % of the precise mode for galvo offsets up to 1 mm and about 20 % too large at 2 mm, where clipping shortens the sweep.
 * **Precise mode** (after you release, a few seconds, background thread): full 2-D pupil integral at several field radii — tilted cone, decentred TAG phase, clipped pupil.
 * Galvo geometry: exact vector reflection through X galvo → 1:1 relay → Y galvo.
 
@@ -53,9 +53,11 @@ Notes:
 
 * Non-telecentricity does **not** curve the focal surface. It tilts the scan lines and makes the magnification depth dependent. Field curvature is a separate parameter.
 * An ideal two-galvo scanner with an f·tanθ objective has ≈3 % pincushion at the corners (x ∝ tanθx / cosθy). This is geometric and is not a bow.
-* The volume is max over a continuous TAG sweep. Sampled phases are interpolated, so no dark stripes appear between samples.
+* The volume is max over a continuous TAG sweep. Sampled phases are interpolated, so no dark stripes appear between samples. The display can be switched to the time average over the sweep, which includes the longer dwell at the two ends of the sinusoidal sweep (the piezo page assumes a sinusoidal drive too). The numbers table always uses the peak.
+* The ends of the usable range are interpolated between the sampled TAG phases (25 phases alone would quantise them by about 6 µm).
+* **Spherical aberration decides where the usable range sits.** The objective is taken as perfect in air and focuses straight into tissue: no cover glass, cranial window or correction collar. At the default depth (279.6 µm) the 2P peak of the D = 0 focus is 18 % of its aberration-free value, the brightest point is at a diverging TAG phase (the J0 quartic term cancels part of the aberration there) and only the deeper half of the sweep is usable. At 50 µm depth the usable range is nearly symmetric. The numbers panel prints this ratio and warns below 50 %.
 
-Not included: scattering, tissue inhomogeneity, tilted tissue surface, polarisation (vector) effects, dwell-time weighting of a resonant scanner, objective aberrations other than field curvature.
+Not included: scattering, tissue inhomogeneity, tilted tissue surface, polarisation (vector) effects, cover glass / cranial window and any spherical-aberration correction, dwell-time weighting of the galvos, objective aberrations other than field curvature.
 
 ## Tests
 

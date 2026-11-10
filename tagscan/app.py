@@ -43,13 +43,17 @@ SPECS = [
     ("beta_y_deg", "4b. Y galvo 轉軸傾斜 β_y (°)", -90.0, 90.0, 0.5, 1, "同上，Y 鏡。"),
     ("galvo_incidence_deg", "4c. galvo 入射角 (°)（假設）", 20.0, 70.0, 1.0, 0,
      "鏡面法線與入射光夾角，弓形大小取決於它。預設 45°。"),
-    ("galvo_offset_mm", "5. galvo 離共軛面 Δg (mm)", -2.0, 2.0, 0.01, 2,
-     "galvo 空間的錯位（X、Y 共用）。光束在光瞳上平移 s = M₂²·Δg·tanα。"),
+    ("galvo_offset_mm", "5a. X galvo 離共軛面 Δg_x (mm)", -2.0, 2.0, 0.01, 2,
+     "galvo 空間的錯位。光束在光瞳上沿該鏡的掃描方向平移 s = M₂²·Δg·tanα。\n"
+     "X、Y 兩面鏡各自設定；兩者不同時剪切不再沿徑向（角落會多出切向橫移）。"),
+    ("galvo_offset_y_mm", "5b. Y galvo 離共軛面 Δg_y (mm)", -2.0, 2.0, 0.01, 2, "同上，Y 鏡。"),
     ("pupil_offset_mm", "6. 入瞳離前焦面 e (mm)", -16.8, 16.8, 0.1, 1,
      "0 = 遠心（主光線平行光軸）；16.8 = 光闌在鏡頭上。\n"
      "非遠心造成掃描線傾斜與放大率隨深度變，不造成焦面彎曲（那是場曲）。"),
     ("focus_depth_um", "7. D=0 焦點在組織表面下 (µm)", 50.0, 800.0, 1.0, 0,
-     "決定空氣→組織的深度球差。279.6 µm = 現行 L2 9.8 mm。"),
+     "決定空氣→組織的深度球差。279.6 µm = 現行 L2 9.8 mm。\n"
+     "模型假設物鏡對空氣完美、沒有蓋玻片／顱窗／校正環；球差沒被補償，\n"
+     "可用範圍落在哪一段主要由它決定（數字區會列出 D=0 焦點的 2P 峰值剩多少）。"),
     ("field_curv_um", "+ 物鏡場曲：角落下垂 (µm)", -100.0, 100.0, 1.0, 0,
      "整欄深度加上 S·(r/r_角落)²；+ = 角落較深。理想平場 = 0。"),
     ("vignette_corner", "+ 離軸暈影：角落光瞳保留比例", 0.3, 1.0, 0.01, 2,
@@ -77,7 +81,7 @@ NOTE_TEXT = (
     "<b>讀圖</b>：深色 = 可用（2P ≥ e⁻²）；淡色 = 焦點掃過但 2P < e⁻²（≥ 2% 才畫）。<br>"
     "模型：純量 Debye 波動積分（{drive}、aplanatic、Fresnel、組織深度球差）。<br>"
     "快速模式：軸上精確，離軸效應為近似修正；精確模式：每個視野半徑做 2D 光瞳積分。<br>"
-    "未含：散射、組織不均勻、表面傾斜、偏振、resonant 停留時間。")
+    "未含：散射、組織不均勻、表面傾斜、偏振、蓋玻片／顱窗與球差補償、galvo 停留時間。")
 
 
 class _Worker(QtCore.QObject):
@@ -167,6 +171,13 @@ class ScanPage(QtWidgets.QWidget):
         self.zsc.valueChanged.connect(self._redraw)
         dg.addRow("橫向偏移顯示放大 ×", self.exag)
         dg.addRow("3D 深度顯示放大 ×", self.zsc)
+        self.vol = QtWidgets.QComboBox()
+        self.vol.addItems(["峰值（掃描中最大）", "時間平均（含停留時間）"])
+        self.vol.setToolTip("峰值：每個位置在一次深度掃描中出現過的最大 2P。\n"
+                            "時間平均：一個週期內該位置產生的 2P 總量；正弦掃描在兩端停留較久，兩端會變亮。\n"
+                            "右側數字表一律用峰值。")
+        self.vol.currentIndexChanged.connect(self._redraw)
+        dg.addRow("體積顯示量", self.vol)
         lv.addWidget(disp)
         fixed = QtWidgets.QLabel(fixed_text(Fixed())); fixed.setWordWrap(True)
         lv.addWidget(fixed)
@@ -289,9 +300,12 @@ class ScanPage(QtWidgets.QWidget):
         with np.errstate(invalid="ignore", divide="ignore"):
             ux = np.where(rf > 0, r.fx / rf, 0.0)[..., None]
             uy = np.where(rf > 0, r.fy / rf, 0.0)[..., None]
-        X = r.fx[..., None] + k * r.off * ux
-        Y = r.fy[..., None] + k * r.off * uy
+        X = r.fx[..., None] + k * (r.off * ux - r.offt * uy)
+        Y = r.fy[..., None] + k * (r.off * uy + r.offt * ux)
         return X, Y, r.Z
+
+    def _vol(self):
+        return self.res.Vavg if self.vol.currentIndex() == 1 else self.res.V
 
     def _redraw(self, *_):
         if self.res is None:
@@ -299,7 +313,7 @@ class ScanPage(QtWidgets.QWidget):
         X, Y, Z = self._geom()
         zs = self.zsc.value()
         g = pv.StructuredGrid(X, Y, -Z * zs)  # z = -depth (right-handed, deeper = lower)
-        g["V"] = self.res.V.ravel(order="F")
+        g["V"] = self._vol().ravel(order="F")
         cam = None if self._first else self.plotter.camera_position
         self.plotter.clear()
         # solid regions (cells whose V passes the level), drawn by their outer surface
@@ -369,7 +383,9 @@ class ScanPage(QtWidgets.QWidget):
             return (f"<tr><td>{name}</td><td>{sw[0]:.0f}–{sw[1]:.0f}（{sw[1]-sw[0]:.0f}）</td>"
                     f"<td>{d['centre']:.0f}</td><td>{uu}</td><td>{uc}</td>"
                     f"<td>{d['d0_depth']:.0f}</td><td>{d['brightness']:.2f}</td>"
-                    f"<td>{d['shear_um']:+.2f}</td></tr>")
+                    f"<td>{d['shear_um']:+.2f}"
+                    + (f"（切向 {d['shear_t_um']:+.2f}）" if abs(d["shear_t_um"]) >= 0.005 else "")
+                    + "</td></tr>")
 
         html = ("<table cellspacing=4><tr><th></th><th>主峰掃描 µm</th><th>掃描中心</th>"
                 "<th>可用 µm</th><th>可用中心</th>"
@@ -382,6 +398,8 @@ class ScanPage(QtWidgets.QWidget):
                 f"<b>掃描範圍</b> {s['scan']['width_mm']:.2f} × {s['scan']['height_mm']:.2f} mm（外框）；"
                 f"快軸線長 {s['scan']['fast_line_mm']:.2f} mm、旋轉 {s['scan']['rotation_deg']:.1f}°、"
                 f"最大弓形 {s['scan']['bow_um']:.0f} µm<br>"
+                f"{'Piezo=0' if piezo else 'D=0'} 焦點的 2P 峰值 = 無球差時的 {s['sa_2p_ratio']:.0%}"
+                "（空氣→組織、無補償）<br>"
                 "深度 = 組織表面下；頂−底橫移 = 淺端減深端的徑向位置，負值 = 淺端偏向中心。"
                 + ("<br>Piezo 移動的是整個物鏡，光錐整體平移：非遠心與 galvo 錯位在這裡幾乎不造成"
                    "傾斜或剪切（和 TAG 不同），只影響亮度。" if piezo else ""))
@@ -405,13 +423,14 @@ class ScanPage(QtWidgets.QWidget):
         i = self.sl_kind.currentIndex()
         q = self.sl_pos.value()
         n = r.fx.shape[0]
+        Vq = self._vol()
         if i in (0, 1):
             fc = r.Z[..., 0] - r.z[0]
             tgt = (q - fc) if i == 0 else (r.zd0 - fc)
             Vs = np.empty((n, n)); Xs = np.empty((n, n)); Ys = np.empty((n, n))
             for a in range(n):
                 for b in range(n):
-                    Vs[a, b] = np.interp(tgt[a, b], r.z, r.V[a, b], left=0, right=0)
+                    Vs[a, b] = np.interp(tgt[a, b], r.z, Vq[a, b], left=0, right=0)
                     Xs[a, b] = np.interp(tgt[a, b], r.z, X[a, b])
                     Ys[a, b] = np.interp(tgt[a, b], r.z, Y[a, b])
             title = (f"XY 切面：深度 {q:.0f} µm" if i == 0 else
@@ -426,10 +445,10 @@ class ScanPage(QtWidgets.QWidget):
         other = r.fy if want_x else r.fx      # coordinate that must equal q
         if lines_i:
             k = int(np.argmin(np.abs(other[c, :] - q)))
-            A, B, Vv, at = (X if want_x else Y)[:, k, :], Z[:, k, :], r.V[:, k, :], other[c, k]
+            A, B, Vv, at = (X if want_x else Y)[:, k, :], Z[:, k, :], Vq[:, k, :], other[c, k]
         else:
             k = int(np.argmin(np.abs(other[:, c] - q)))
-            A, B, Vv, at = (X if want_x else Y)[k, :, :], Z[k, :, :], r.V[k, :, :], other[k, c]
+            A, B, Vv, at = (X if want_x else Y)[k, :, :], Z[k, :, :], Vq[k, :, :], other[k, c]
         if want_x:
             return ("xz", A, B, Vv, f"XZ 切面：y ≈ {at:.0f} µm（沿一條掃描線）", ("x (µm)", "深度 (µm)"), None)
         return ("yz", A, B, Vv, f"YZ 切面：x ≈ {at:.0f} µm（沿一條掃描線）", ("y (µm)", "深度 (µm)"), None)
@@ -455,7 +474,8 @@ class ScanPage(QtWidgets.QWidget):
         else:
             ax.set_aspect("equal")
         cb = self.fig.colorbar(pm, ax=ax)
-        cb.set_label("2P = |E|⁴（全體積正規化，log）")
+        cb.set_label(("2P = |E|⁴ 時間平均" if self.vol.currentIndex() == 1 else "2P = |E|⁴ 峰值")
+                     + "（全體積正規化，log）")
         k = self.exag.value()
         ax.set_title(title + "\n青線 = 可用門檻 e⁻²" + (f"；橫向偏移 ×{k:g}" if k != 1 else ""), fontsize=10)
         ax.set_xlabel(labs[0]); ax.set_ylabel(labs[1])
